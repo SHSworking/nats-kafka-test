@@ -1,0 +1,160 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nats-kafka-test
+---
+# ==========================================
+# 1. NATS SERVER DEPLOYMENT
+# ==========================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats-server
+  namespace: nats-kafka-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nats-server
+  template:
+    metadata:
+      labels:
+        app: nats-server
+    spec:
+      containers:
+        - name: nats
+          image: nats:2.10-alpine
+          ports:
+            - containerPort: 4222
+              name: client
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats-service
+  namespace: nats-kafka-test
+spec:
+  selector:
+    app: nats-server
+  ports:
+    - protocol: TCP
+      port: 4222
+      targetPort: 4222
+---
+# ==========================================
+# 2. APACHE KAFKA BROKER (KRaft Mode)
+# ==========================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-broker
+  namespace: nats-kafka-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka-broker
+  template:
+    metadata:
+      labels:
+        app: kafka-broker
+    spec:
+      containers:
+        - name: kafka
+          image: apache/kafka:3.8.0
+          env:
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            - name: KAFKA_LISTENERS
+              value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "PLAINTEXT://kafka-service.nats-kafka-test.svc.cluster.local:9092"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "1@localhost:9093"
+            - name: KAFKA_LOG_DIRS
+              value: "/tmp/kraft-combined-logs"
+            - name: KAFKA_OFFERED_CLUSTERS_VOTER
+              value: "true"
+          ports:
+            - containerPort: 9092
+              name: broker
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-service
+  namespace: nats-kafka-test
+spec:
+  selector:
+    app: kafka-broker
+  ports:
+    - protocol: TCP
+      port: 9092
+      targetPort: 9092
+---
+# ==========================================
+# 3. NATS-KAFKA BRIDGE CONFIGURATION,  KafkaToNATS is case-sensitive
+# ==========================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bridge-config
+  namespace: nats-kafka-test
+data:
+  nats-kafka.yaml: |
+    logging {
+      time = true
+      debug = true
+      trace = false
+    }
+    nats {
+      servers = ["nats://nats-service.nats-kafka-test.svc.cluster.local:4222"]
+      connecttimeout = 5000
+    }
+    connect = [
+      {
+        type = "KafkaToNATS" 
+        brokers = ["kafka-service.nats-kafka-test.svc.cluster.local:9092"]  
+        topic = "test-kafka-stream"
+        subject = "test.nats.received"
+      }
+    ]
+---
+# ==========================================
+# 4. NATS-KAFKA BRIDGE DEPLOYMENT
+# ==========================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats-kafka-bridge
+  namespace: nats-kafka-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nats-kafka-bridge
+  template:
+    metadata:
+      labels:
+        app: nats-kafka-bridge
+    spec:
+      containers:
+        - name: bridge
+          image: natsio/nats-kafka:1.4.2 #synadia/nats-kafka:0.15.4
+          args: ["-c", "/etc/nats-kafka/nats-kafka.yaml"]
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/nats-kafka
+          ports:
+            - containerPort: 8080
+              name: metrics
+      volumes:
+        - name: config-volume
+          configMap:
+            name: bridge-config
